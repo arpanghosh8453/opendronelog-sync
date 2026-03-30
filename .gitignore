@@ -25,3 +25,4 @@ dist-ssr
 
 # Android signing secrets
 upload-keystore.jks
+keystore.base64.txt
