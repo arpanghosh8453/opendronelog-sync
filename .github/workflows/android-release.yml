@@ -136,6 +136,9 @@ jobs:
             echo "Android project already initialized"
           fi
 
+      - name: Sync Android launcher icons
+        run: npm run mobile:android:sync-icons
+
       - name: Build release APKs (universal and split)
         id: build_apks
         run: |

@@ -71,6 +71,12 @@ fn file_hash(path: &Path) -> Result<String, String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
+fn bytes_hash(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
 fn has_allowed_extension(path: &Path, allowed_extensions: &std::collections::HashSet<String>) -> bool {
     let extension = path
         .extension()
@@ -423,6 +429,73 @@ async fn upload_sync_file(
 }
 
 #[tauri::command]
+async fn upload_sync_file_bytes(
+    server_url: String,
+    profile: String,
+    session_token: Option<String>,
+    file_name: String,
+    file_bytes: Vec<u8>,
+) -> Result<UploadSyncResponse, String> {
+    debug_log(&format!(
+        "upload_sync_file_bytes called server={} profile={} file={} size={}",
+        server_url,
+        profile,
+        file_name,
+        file_bytes.len()
+    ));
+
+    let clean_base = server_url.trim().trim_end_matches('/');
+    if clean_base.is_empty() {
+        debug_log("upload_sync_file_bytes failed: missing server URL");
+        return Err("Missing server URL".to_string());
+    }
+
+    if file_bytes.is_empty() {
+        return Err("Selected mobile file is empty or unavailable".to_string());
+    }
+
+    let hash = bytes_hash(&file_bytes);
+    let safe_name = if file_name.trim().is_empty() {
+        "mobile-log.bin".to_string()
+    } else {
+        file_name
+    };
+
+    let file_part = multipart::Part::bytes(file_bytes).file_name(safe_name);
+    let form = multipart::Form::new().part("file", file_part);
+
+    let client = reqwest::Client::new();
+    let mut request = client
+        .post(format!("{}/api/import", clean_base))
+        .header("X-Profile", profile)
+        .multipart(form);
+
+    if let Some(token) = session_token {
+        if !token.trim().is_empty() {
+            request = request.header("X-Session", token);
+        }
+    }
+
+    let response = request.send().await.map_err(|e| format!("Upload request failed: {}", e))?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_else(|_| "".to_string());
+
+    Ok(UploadSyncResponse {
+        success: status.is_success(),
+        status_code: status.as_u16(),
+        message: if body.is_empty() {
+            status
+                .canonical_reason()
+                .unwrap_or("Unknown response")
+                .to_string()
+        } else {
+            body
+        },
+        file_hash: hash,
+    })
+}
+
+#[tauri::command]
 fn get_default_mobile_sync_folder(app: AppHandle) -> Result<String, String> {
     debug_log("get_default_mobile_sync_folder called");
     let mut dir = app
@@ -444,10 +517,12 @@ pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_android_fs::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             scan_sync_folder,
             upload_sync_file,
+            upload_sync_file_bytes,
             get_default_mobile_sync_folder,
             pick_sync_folder_native,
             start_sync_watcher,

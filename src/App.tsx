@@ -36,6 +36,38 @@ type InitProgressState = {
 
 const STATUS_ORDER = ["pending", "uploaded", "imported", "blacklisted"] as const;
 type OrderedStatus = (typeof STATUS_ORDER)[number];
+const MOBILE_SYNC_URI_KEY = "odlSyncMobileUri";
+
+type AndroidFsUri = {
+  uri: string;
+  documentTopTreeUri: string | null;
+};
+
+type AndroidFsEntry = {
+  type: "Dir" | "File";
+  name: string;
+  uri: AndroidFsUri;
+  mimeType?: string;
+};
+
+type AndroidFsModule = {
+  AndroidFs: {
+    showOpenDirPicker: (options?: { localOnly?: boolean }) => Promise<AndroidFsUri | null>;
+    persistPickerUriPermission: (uri: AndroidFsUri) => Promise<void>;
+    checkPersistedPickerUriPermission: (uri: AndroidFsUri, state: string) => Promise<boolean>;
+    readDir: (uri: AndroidFsUri, options?: { offset?: number; limit?: number }) => Promise<AndroidFsEntry[]>;
+    readFile: (uri: AndroidFsUri) => Promise<Uint8Array>;
+  };
+  AndroidUriPermissionState: {
+    ReadOrWrite: string;
+  };
+  isAndroid: () => boolean;
+};
+
+type MobileFilePayload = {
+  name: string;
+  bytes: Uint8Array;
+};
 
 function debugLog(event: string, details?: Record<string, unknown>): void {
   const payload = {
@@ -87,6 +119,7 @@ function App() {
   const refreshQueueRef = useRef(0);
   const watcherCleanupRef = useRef<null | (() => Promise<void>)>(null);
   const authContextRef = useRef("");
+  const mobileFilePayloadByPathRef = useRef<Record<string, MobileFilePayload>>({});
   const mobile = useMemo(() => isLikelyMobile(), []);
   const isRefreshInProgress = refreshClickIntent || syncProgress.active || refreshActiveCount > 0 || refreshQueueCount > 0;
   const isSyncInProgress = syncClickIntent || isSyncNowRunning || uploadingPath.length > 0;
@@ -399,9 +432,22 @@ function App() {
     debugLog("folder.pick.start", { mobile });
     if (mobile) {
       try {
+        const androidFs = await loadAndroidFsModule();
+        if (androidFs?.isAndroid()) {
+          const pickedUri = await androidFs.AndroidFs.showOpenDirPicker({ localOnly: false });
+          if (pickedUri) {
+            await androidFs.AndroidFs.persistPickerUriPermission(pickedUri);
+            setMobileSyncUri(pickedUri);
+            setFolderInput(pickedUri.uri);
+            debugLog("folder.pick.mobile.saf.done", { uri: pickedUri.uri });
+            return;
+          }
+        }
+
         const folder = await invoke<string>("get_default_mobile_sync_folder");
+        setMobileSyncUri(null);
         setFolderInput(folder);
-        debugLog("folder.pick.mobile.done", { folder });
+        debugLog("folder.pick.mobile.fallback.done", { folder });
       } catch (err) {
         debugLog("folder.pick.mobile.failed", { error: asError(err) });
         setMessage(asError(err));
@@ -438,6 +484,16 @@ function App() {
     }
 
     const selectedFolder = folderInput.trim();
+    if (mobile && isContentUri(selectedFolder) && !getMobileSyncUri()) {
+      setMessage("Please browse and grant folder access again.");
+      return;
+    }
+
+    if (!isContentUri(selectedFolder)) {
+      setMobileSyncUri(null);
+    }
+
+    mobileFilePayloadByPathRef.current = {};
     debugLog("folder.save.start", { folder: selectedFolder });
     setConfig((prev) => ({ ...prev, syncFolder: selectedFolder }));
     setMessage("");
@@ -475,19 +531,81 @@ function App() {
       debugLog("sync.refresh.allowedExtensions.request.done", { extensions: exts.length });
       setAllowedExtensions(exts);
 
-      setSyncProgress({ active: true, percent: 35, label: "Scanning local folder..." });
-      await waitForVisualCommit();
-      debugLog("sync.refresh.scan.request.start", {
-        folderPath,
-        extensions: exts,
-      });
-      const localPromise = invoke<LocalFileEntry[]>("scan_sync_folder", {
-        folderPath,
-        allowedExtensions: exts,
-      }).then((result) => {
-        setSyncProgress({ active: true, percent: 60, label: "Fetched local files." });
-        return result;
-      });
+      let localPromise: Promise<LocalFileEntry[]>;
+      if (mobile && isContentUri(folderPath)) {
+        localPromise = (async () => {
+          setSyncProgress({ active: true, percent: 35, label: "Scanning selected mobile folder..." });
+          const androidFs = await loadAndroidFsModule();
+          const persistedUri = getMobileSyncUri();
+          if (!androidFs?.isAndroid() || !persistedUri) {
+            throw new Error("Mobile folder access not available. Please pick the folder again.");
+          }
+
+          const hasPermission = await androidFs.AndroidFs.checkPersistedPickerUriPermission(
+            persistedUri,
+            androidFs.AndroidUriPermissionState.ReadOrWrite,
+          );
+          if (!hasPermission) {
+            throw new Error("Folder permission expired. Please browse and grant access again.");
+          }
+
+          const allowed = new Set(exts.map((e) => e.trim().replace(/^\./, "").toLowerCase()));
+          const files: LocalFileEntry[] = [];
+          const payloadByPath: Record<string, MobileFilePayload> = {};
+
+          const walk = async (uri: AndroidFsUri): Promise<void> => {
+            const entries = await androidFs.AndroidFs.readDir(uri);
+            for (const entry of entries) {
+              if (entry.type === "Dir") {
+                await walk(entry.uri);
+                continue;
+              }
+              if (entry.type !== "File" || !hasAllowedExtension(entry.name, allowed)) {
+                continue;
+              }
+
+              const content = await androidFs.AndroidFs.readFile(entry.uri);
+              const bytes = content instanceof Uint8Array ? content : new Uint8Array(content);
+              const normalized = new Uint8Array(bytes.byteLength);
+              normalized.set(bytes);
+              const hash = await sha256Hex(normalized);
+
+              payloadByPath[entry.uri.uri] = {
+                name: entry.name,
+                bytes: normalized,
+              };
+
+              files.push({
+                name: entry.name,
+                path: entry.uri.uri,
+                size: normalized.byteLength,
+                modifiedMs: Date.now(),
+                hash,
+              });
+            }
+          };
+
+          await walk(persistedUri);
+          files.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()));
+          mobileFilePayloadByPathRef.current = payloadByPath;
+          setSyncProgress({ active: true, percent: 60, label: "Fetched mobile folder files." });
+          return files;
+        })();
+      } else {
+        setSyncProgress({ active: true, percent: 35, label: "Scanning local folder..." });
+        await waitForVisualCommit();
+        debugLog("sync.refresh.scan.request.start", {
+          folderPath,
+          extensions: exts,
+        });
+        localPromise = invoke<LocalFileEntry[]>("scan_sync_folder", {
+          folderPath,
+          allowedExtensions: exts,
+        }).then((result) => {
+          setSyncProgress({ active: true, percent: 60, label: "Fetched local files." });
+          return result;
+        });
+      }
 
       const importedPromise = getServerFileHashes(config.serverUrl, config.activeProfile, config.sessionToken).then((result) => {
         setSyncProgress({ active: true, percent: 75, label: "Fetched imported file hashes." });
@@ -598,12 +716,25 @@ function App() {
         setUploadingPath(file.path);
         setFiles((prev) => prev.map((item) => (item.path === file.path ? { ...item, status: "uploading" } : item)));
 
-        const result = await invoke<UploadSyncResponse>("upload_sync_file", {
-          serverUrl: config.serverUrl,
-          profile: config.activeProfile,
-          sessionToken: config.sessionToken,
-          filePath: file.path,
-        });
+        const mobilePayload = mobileFilePayloadByPathRef.current[file.path];
+        if (isContentUri(file.path) && !mobilePayload) {
+          throw new Error(`Missing mobile file payload for ${file.name}. Refresh and try again.`);
+        }
+
+        const result = isContentUri(file.path)
+          ? await invoke<UploadSyncResponse>("upload_sync_file_bytes", {
+              serverUrl: config.serverUrl,
+              profile: config.activeProfile,
+              sessionToken: config.sessionToken,
+              fileName: file.name,
+              fileBytes: mobilePayload ? Array.from(mobilePayload.bytes) : [],
+            })
+          : await invoke<UploadSyncResponse>("upload_sync_file", {
+              serverUrl: config.serverUrl,
+              profile: config.activeProfile,
+              sessionToken: config.sessionToken,
+              filePath: file.path,
+            });
 
         if (result.statusCode === 401) {
           debugLog("sync.manual.upload.unauthorized", { file: file.path });
@@ -888,6 +1019,69 @@ async function copyHash(hash: string, fileName: string, setMessage: (msg: string
   } catch {
     setMessage("Failed to copy hash");
   }
+}
+
+function isContentUri(pathOrUri: string): boolean {
+  return pathOrUri.startsWith("content://");
+}
+
+function getMobileSyncUri(): AndroidFsUri | null {
+  if (typeof localStorage === "undefined") return null;
+  const raw = localStorage.getItem(MOBILE_SYNC_URI_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as AndroidFsUri;
+    if (!parsed || typeof parsed.uri !== "string") return null;
+    return {
+      uri: parsed.uri,
+      documentTopTreeUri:
+        parsed.documentTopTreeUri === null || typeof parsed.documentTopTreeUri === "string"
+          ? parsed.documentTopTreeUri
+          : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function setMobileSyncUri(uri: AndroidFsUri | null): void {
+  if (typeof localStorage === "undefined") return;
+  if (!uri) {
+    localStorage.removeItem(MOBILE_SYNC_URI_KEY);
+    return;
+  }
+  localStorage.setItem(MOBILE_SYNC_URI_KEY, JSON.stringify(uri));
+}
+
+async function loadAndroidFsModule(): Promise<AndroidFsModule | null> {
+  try {
+    const mod = await import("tauri-plugin-android-fs-api");
+    return mod as unknown as AndroidFsModule;
+  } catch {
+    return null;
+  }
+}
+
+function hasAllowedExtension(fileName: string, allowed: Set<string>): boolean {
+  const dot = fileName.lastIndexOf(".");
+  if (dot < 0 || dot === fileName.length - 1) return false;
+  const ext = fileName.slice(dot + 1).trim().toLowerCase();
+  return allowed.has(ext);
+}
+
+async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  const normalized = new Uint8Array(bytes);
+  const buffer = normalized.buffer.slice(
+    normalized.byteOffset,
+    normalized.byteOffset + normalized.byteLength,
+  ) as ArrayBuffer;
+  const digest = await crypto.subtle.digest("SHA-256", buffer);
+  const hashBytes = new Uint8Array(digest);
+  let hex = "";
+  for (const b of hashBytes) {
+    hex += b.toString(16).padStart(2, "0");
+  }
+  return hex;
 }
 
 function groupByStatus(items: SyncItem[]): Record<OrderedStatus, SyncItem[]> {
