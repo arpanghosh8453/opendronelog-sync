@@ -143,14 +143,14 @@ jobs:
           LOG_PATH="$RUNNER_TEMP/android-build.log"
           echo "build_log=$LOG_PATH" >> "$GITHUB_OUTPUT"
 
-          npm run tauri android build -- --apk --release 2>&1 | tee "$LOG_PATH"
-          npm run tauri android build -- --apk --release --split-per-abi 2>&1 | tee -a "$LOG_PATH"
+          npm run tauri android build -- --apk 2>&1 | tee "$LOG_PATH"
+          npm run tauri android build -- --apk --split-per-abi 2>&1 | tee -a "$LOG_PATH"
 
       - name: Build release AABs (split per ABI)
         if: ${{ inputs.build_aab }}
         run: |
           set -euo pipefail
-          npm run tauri android build -- --aab --release --split-per-abi
+          npm run tauri android build -- --aab --split-per-abi
 
       - name: Ensure Android signing tools
         run: |
