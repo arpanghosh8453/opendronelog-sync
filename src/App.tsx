@@ -120,6 +120,7 @@ function App() {
   const watcherCleanupRef = useRef<null | (() => Promise<void>)>(null);
   const authContextRef = useRef("");
   const mobileFilePayloadByPathRef = useRef<Record<string, MobileFilePayload>>({});
+  const recentlyUploadedHashesRef = useRef<Set<string>>(new Set());
   const mobile = useMemo(() => isLikelyMobile(), []);
   const isRefreshInProgress = refreshClickIntent || syncProgress.active || refreshActiveCount > 0 || refreshQueueCount > 0;
   const isSyncInProgress = syncClickIntent || isSyncNowRunning || uploadingPath.length > 0;
@@ -375,6 +376,7 @@ function App() {
       setAllowedExtensions([]);
       setFiles([]);
       setUploadingPath("");
+      recentlyUploadedHashesRef.current.clear();
       setFolderInput("");
       setConfig((prev) => ({
         ...prev,
@@ -494,6 +496,7 @@ function App() {
     }
 
     mobileFilePayloadByPathRef.current = {};
+    recentlyUploadedHashesRef.current.clear();
     debugLog("folder.save.start", { folder: selectedFolder });
     setConfig((prev) => ({ ...prev, syncFolder: selectedFolder }));
     setMessage("");
@@ -633,8 +636,15 @@ function App() {
 
       const nextItems = localFiles.map((f) => {
         if (f.path === uploadingPath) return { ...f, status: "uploading" as const };
-        if (importedHashes.has(f.hash)) return { ...f, status: "imported" as const };
-        if (blacklistedHashes.has(f.hash)) return { ...f, status: "blacklisted" as const };
+        if (importedHashes.has(f.hash)) {
+          recentlyUploadedHashesRef.current.delete(f.hash);
+          return { ...f, status: "imported" as const };
+        }
+        if (blacklistedHashes.has(f.hash)) {
+          recentlyUploadedHashesRef.current.delete(f.hash);
+          return { ...f, status: "blacklisted" as const };
+        }
+        if (recentlyUploadedHashesRef.current.has(f.hash)) return { ...f, status: "uploaded" as const };
         return { ...f, status: "pending" as const };
       });
 
@@ -722,13 +732,14 @@ function App() {
         }
 
         const result = isContentUri(file.path)
-          ? await invoke<UploadSyncResponse>("upload_sync_file_bytes", {
-              serverUrl: config.serverUrl,
-              profile: config.activeProfile,
-              sessionToken: config.sessionToken,
-              fileName: file.name,
-              fileBytes: mobilePayload ? Array.from(mobilePayload.bytes) : [],
-            })
+          ? await uploadMobileFile(
+              config.serverUrl,
+              config.activeProfile,
+              config.sessionToken,
+              file.name,
+              mobilePayload ? mobilePayload.bytes : new Uint8Array(),
+              file.hash,
+            )
           : await invoke<UploadSyncResponse>("upload_sync_file", {
               serverUrl: config.serverUrl,
               profile: config.activeProfile,
@@ -753,6 +764,7 @@ function App() {
           );
         } else {
           debugLog("sync.manual.upload.done", { file: file.path, statusCode: result.statusCode });
+          recentlyUploadedHashesRef.current.add(file.hash);
           setFiles((prev) =>
             prev.map((item) => (item.path === file.path ? { ...item, status: "uploaded", message: "Uploaded" } : item)),
           );
@@ -1019,6 +1031,50 @@ async function copyHash(hash: string, fileName: string, setMessage: (msg: string
   } catch {
     setMessage("Failed to copy hash");
   }
+}
+
+async function uploadMobileFile(
+  serverUrl: string,
+  profile: string,
+  sessionToken: string,
+  fileName: string,
+  bytes: Uint8Array,
+  fileHash: string,
+): Promise<UploadSyncResponse> {
+  if (!bytes.length) {
+    return {
+      success: false,
+      statusCode: 0,
+      message: "Selected mobile file is empty or unavailable",
+      fileHash,
+    };
+  }
+
+  const form = new FormData();
+  const normalized = new Uint8Array(bytes);
+  const rawBuffer = normalized.buffer.slice(
+    normalized.byteOffset,
+    normalized.byteOffset + normalized.byteLength,
+  ) as ArrayBuffer;
+  const blob = new Blob([rawBuffer], { type: "application/octet-stream" });
+  form.append("file", blob, fileName || "mobile-log.bin");
+
+  const response = await fetch(`${serverUrl}/api/import`, {
+    method: "POST",
+    headers: {
+      "X-Profile": profile,
+      "X-Session": sessionToken,
+    },
+    body: form,
+  });
+
+  const bodyText = await response.text().catch(() => "");
+  return {
+    success: response.ok,
+    statusCode: response.status,
+    message: bodyText || response.statusText || "Upload failed",
+    fileHash,
+  };
 }
 
 function isContentUri(pathOrUri: string): boolean {
