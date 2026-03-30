@@ -1,0 +1,184 @@
+name: Desktop Binary Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to build from for manual dispatch"
+        required: false
+        default: "main"
+        type: string
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  resolve-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      branch: ${{ steps.resolve.outputs.branch }}
+    steps:
+      - name: Resolve version tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+            BRANCH=""
+          else
+            TAG=$(gh release view --repo "${{ github.repository }}" --json tagName -q '.tagName')
+            if [ -z "${TAG}" ]; then
+              echo "Unable to resolve latest GitHub release tag for workflow_dispatch"
+              exit 1
+            fi
+            BRANCH="${{ inputs.branch }}"
+            if [ -z "${BRANCH}" ]; then
+              BRANCH="main"
+            fi
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: ${TAG}"
+          if [ -n "${BRANCH}" ]; then
+            echo "Resolved branch: ${BRANCH}"
+          fi
+
+  cleanup-desktop-assets:
+    needs: resolve-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.resolve-tag.outputs.tag }}
+    steps:
+      - name: Remove existing desktop assets on workflow_dispatch
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "Not workflow_dispatch; skipping desktop release asset cleanup"
+            exit 0
+          fi
+
+          mapfile -t ASSETS < <(gh release view "$TAG" \
+            --repo "${{ github.repository }}" \
+            --json assets \
+            -q '.assets[].name' | grep -E '^(opendronelog-sync_.*|checksums\.txt)$' || true)
+
+          if [ "${#ASSETS[@]}" -eq 0 ]; then
+            echo "No existing desktop assets to remove"
+            exit 0
+          fi
+
+          for name in "${ASSETS[@]}"; do
+            echo "Removing old desktop asset: $name"
+            gh release delete-asset "$TAG" "$name" \
+              --repo "${{ github.repository }}" \
+              --yes
+          done
+
+  build-desktop:
+    needs: [resolve-tag, cleanup-desktop-assets]
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && needs.resolve-tag.outputs.branch || needs.resolve-tag.outputs.tag }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            rpm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build and upload desktop release assets
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          args: "--target ${{ matrix.target }} --verbose"
+          tagName: ${{ needs.resolve-tag.outputs.tag }}
+          releaseName: OpenDronelog Sync ${{ needs.resolve-tag.outputs.tag }}
+          includeRelease: true
+          uploadPlainBinary: true
+
+  checksums:
+    needs: [resolve-tag, build-desktop]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir assets
+          gh release download "$TAG" \
+            --repo "${{ github.repository }}" \
+            --dir assets
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd assets
+          sha256sum * | sort -k2 > ../checksums.txt
+
+      - name: Upload checksums to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" checksums.txt \
+            --repo "${{ github.repository }}" \
+            --clobber

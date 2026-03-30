@@ -1,0 +1,191 @@
+name: Android Binary Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to build from for manual dispatch"
+        required: false
+        default: "main"
+        type: string
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  resolve-tag:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      branch: ${{ steps.resolve.outputs.branch }}
+    steps:
+      - name: Resolve version tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+            BRANCH=""
+          else
+            TAG=$(gh release view --repo "${{ github.repository }}" --json tagName -q '.tagName')
+            if [ -z "${TAG}" ]; then
+              echo "Unable to resolve latest GitHub release tag for workflow_dispatch"
+              exit 1
+            fi
+            BRANCH="${{ inputs.branch }}"
+            if [ -z "${BRANCH}" ]; then
+              BRANCH="main"
+            fi
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+          echo "Resolved tag: ${TAG}"
+          if [ -n "${BRANCH}" ]; then
+            echo "Resolved branch: ${BRANCH}"
+          fi
+
+  cleanup-android-assets:
+    needs: resolve-tag
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ needs.resolve-tag.outputs.tag }}
+    steps:
+      - name: Remove existing android assets on workflow_dispatch
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ]; then
+            echo "Not workflow_dispatch; skipping android asset cleanup"
+            exit 0
+          fi
+
+          mapfile -t ASSETS < <(gh release view "$TAG" \
+            --repo "${{ github.repository }}" \
+            --json assets \
+            -q '.assets[].name' | grep -E '^(opendronelog-sync_.*\.(apk|aab))$' || true)
+
+          if [ "${#ASSETS[@]}" -eq 0 ]; then
+            echo "No existing Android assets to remove"
+            exit 0
+          fi
+
+          for name in "${ASSETS[@]}"; do
+            echo "Removing old Android asset: $name"
+            gh release delete-asset "$TAG" "$name" \
+              --repo "${{ github.repository }}" \
+              --yes
+          done
+
+  build-android:
+    needs: [resolve-tag, cleanup-android-assets]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && needs.resolve-tag.outputs.branch || needs.resolve-tag.outputs.tag }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Rust targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Ensure Tauri CLI
+        run: npm install -g @tauri-apps/cli@^2
+
+      - name: Initialize Android project
+        run: |
+          set -euo pipefail
+          if [ ! -d "src-tauri/gen/android" ]; then
+            npm run tauri android init -- --ci
+          else
+            echo "Android project already initialized"
+          fi
+
+      - name: Build Android binaries
+        run: |
+          set -euo pipefail
+          npm run tauri android build
+
+      - name: Collect Android artifacts
+        id: collect
+        env:
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p android-artifacts
+
+          mapfile -t FILES < <(find src-tauri/gen/android/app/build/outputs -type f \( -name '*.apk' -o -name '*.aab' \) | sort)
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "No Android APK/AAB artifacts found"
+            exit 1
+          fi
+
+          for file in "${FILES[@]}"; do
+            base=$(basename "$file")
+            cp "$file" "android-artifacts/opendronelog-sync_${TAG}_${base}"
+          done
+
+          echo "dir=android-artifacts" >> "$GITHUB_OUTPUT"
+
+      - name: Upload CI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release-artifacts
+          path: ${{ steps.collect.outputs.dir }}/*
+
+      - name: Ensure release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release exists for $TAG"
+          else
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --verify-tag \
+              --title "OpenDronelog Sync $TAG" \
+              --notes "Automated Android release assets for $TAG"
+          fi
+
+      - name: Upload Android release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.resolve-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" \
+            ${{ steps.collect.outputs.dir }}/* \
+            --repo "${{ github.repository }}" \
+            --clobber
