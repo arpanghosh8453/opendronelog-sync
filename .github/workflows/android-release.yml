@@ -10,6 +10,11 @@ on:
         required: false
         default: "main"
         type: string
+      build_aab:
+        description: "Build split AAB artifacts (optional)"
+        required: false
+        default: false
+        type: boolean
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -71,7 +76,7 @@ jobs:
           mapfile -t ASSETS < <(gh release view "$TAG" \
             --repo "${{ github.repository }}" \
             --json assets \
-            -q '.assets[].name' | grep -E '^(opendronelog-sync_.*\.(apk|aab))$' || true)
+            -q '.assets[].name' | grep -E '^(opendronelog-sync_.*_android.*\.apk|opendronelog-sync_.*\.aab)$' || true)
 
           if [ "${#ASSETS[@]}" -eq 0 ]; then
             echo "No existing Android assets to remove"
@@ -131,37 +136,131 @@ jobs:
             echo "Android project already initialized"
           fi
 
-      - name: Build Android binaries
+      - name: Build release APKs (universal and split)
+        id: build_apks
         run: |
           set -euo pipefail
-          npm run tauri android build
+          LOG_PATH="$RUNNER_TEMP/android-build.log"
+          echo "build_log=$LOG_PATH" >> "$GITHUB_OUTPUT"
 
-      - name: Collect Android artifacts
-        id: collect
-        env:
-          TAG: ${{ needs.resolve-tag.outputs.tag }}
+          npm run tauri android build -- --apk --release 2>&1 | tee "$LOG_PATH"
+          npm run tauri android build -- --apk --release --split-per-abi 2>&1 | tee -a "$LOG_PATH"
+
+      - name: Build release AABs (split per ABI)
+        if: ${{ inputs.build_aab }}
         run: |
           set -euo pipefail
-          mkdir -p android-artifacts
+          npm run tauri android build -- --aab --release --split-per-abi
 
-          mapfile -t FILES < <(find src-tauri/gen/android/app/build/outputs -type f \( -name '*.apk' -o -name '*.aab' \) | sort)
-          if [ "${#FILES[@]}" -eq 0 ]; then
-            echo "No Android APK/AAB artifacts found"
+      - name: Ensure Android signing tools
+        run: |
+          set -euo pipefail
+
+          sdkmanager --install "build-tools;35.0.0"
+
+          BUILD_TOOLS_DIR=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1)
+          if [ -z "${BUILD_TOOLS_DIR:-}" ]; then
+            echo "Unable to locate Android build-tools directory under $ANDROID_HOME/build-tools"
             exit 1
           fi
 
-          for file in "${FILES[@]}"; do
-            base=$(basename "$file")
-            cp "$file" "android-artifacts/opendronelog-sync_${TAG}_${base}"
+          if [ ! -x "$BUILD_TOOLS_DIR/zipalign" ] || [ ! -x "$BUILD_TOOLS_DIR/apksigner" ]; then
+            echo "zipalign/apksigner not found in $BUILD_TOOLS_DIR"
+            exit 1
+          fi
+
+          echo "$BUILD_TOOLS_DIR" >> "$GITHUB_PATH"
+          "$BUILD_TOOLS_DIR/apksigner" --version >/dev/null
+
+      - name: Sign release APKs (universal and split)
+        id: sign_apks
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ] || [ -z "${ANDROID_KEY_ALIAS:-}" ] || [ -z "${ANDROID_KEYSTORE_PASSWORD:-}" ]; then
+            echo "Missing required signing secrets: ANDROID_KEYSTORE_BASE64, ANDROID_KEY_ALIAS, ANDROID_KEYSTORE_PASSWORD"
+            exit 1
+          fi
+
+          KEY_PASSWORD="${ANDROID_KEY_PASSWORD:-$ANDROID_KEYSTORE_PASSWORD}"
+          TAG="${{ needs.resolve-tag.outputs.tag }}"
+          KEYSTORE_PATH="$RUNNER_TEMP/upload-keystore.jks"
+          SIGNED_DIR="$RUNNER_TEMP/signed-apks"
+          APK_OUTPUT_DIR="src-tauri/gen/android/app/build/outputs/apk"
+
+          ZIPALIGN_BIN=$(command -v zipalign || true)
+          APKSIGNER_BIN=$(command -v apksigner || true)
+          if [ -z "$ZIPALIGN_BIN" ] || [ -z "$APKSIGNER_BIN" ]; then
+            BUILD_TOOLS_DIR=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n1)
+            ZIPALIGN_BIN="$BUILD_TOOLS_DIR/zipalign"
+            APKSIGNER_BIN="$BUILD_TOOLS_DIR/apksigner"
+          fi
+
+          if [ ! -x "$ZIPALIGN_BIN" ] || [ ! -x "$APKSIGNER_BIN" ]; then
+            echo "Could not resolve zipalign/apksigner binaries"
+            exit 1
+          fi
+
+          mkdir -p "$SIGNED_DIR"
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+
+          mapfile -t UNSIGNED_APKS < <(find "$APK_OUTPUT_DIR" -type f -name '*-unsigned.apk' | sort)
+          if [ "${#UNSIGNED_APKS[@]}" -eq 0 ]; then
+            echo "No unsigned APKs were found in $APK_OUTPUT_DIR"
+            exit 1
+          fi
+
+          for UNSIGNED_APK in "${UNSIGNED_APKS[@]}"; do
+            BASE_NAME=$(basename "$UNSIGNED_APK")
+            APK_VARIANT=$(echo "$UNSIGNED_APK" | sed -E 's#.*?/apk/([^/]+)/.*#\1#')
+            if [ "$APK_VARIANT" = "$UNSIGNED_APK" ]; then
+              APK_VARIANT="unknown"
+            fi
+
+            ALIGNED_APK="$RUNNER_TEMP/aligned-${BASE_NAME/-unsigned.apk/.apk}"
+
+            if [[ "$BASE_NAME" == *universal* ]] || [[ "$APK_VARIANT" == universal ]]; then
+              OUTPUT_NAME="opendronelog-sync_${TAG}_android-universal.apk"
+            else
+              OUTPUT_NAME="opendronelog-sync_${TAG}_${APK_VARIANT}_android.apk"
+            fi
+
+            OUTPUT_APK="$SIGNED_DIR/$OUTPUT_NAME"
+
+            "$ZIPALIGN_BIN" -p -f 4 "$UNSIGNED_APK" "$ALIGNED_APK"
+
+            "$APKSIGNER_BIN" sign \
+              --ks "$KEYSTORE_PATH" \
+              --ks-key-alias "$ANDROID_KEY_ALIAS" \
+              --ks-pass "pass:$ANDROID_KEYSTORE_PASSWORD" \
+              --key-pass "pass:$KEY_PASSWORD" \
+              --out "$OUTPUT_APK" \
+              "$ALIGNED_APK"
+
+            "$APKSIGNER_BIN" verify --verbose "$OUTPUT_APK"
           done
 
-          echo "dir=android-artifacts" >> "$GITHUB_OUTPUT"
+          echo "signed_dir=$SIGNED_DIR" >> "$GITHUB_OUTPUT"
 
-      - name: Upload CI artifact
+      - name: Upload signed APK artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: android-release-artifacts
-          path: ${{ steps.collect.outputs.dir }}/*
+          name: android-apk-release-all-signed
+          path: |
+            ${{ steps.sign_apks.outputs.signed_dir }}/*.apk
+
+      - name: Upload split AAB artifacts
+        if: ${{ inputs.build_aab }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-aab-release-split
+          path: |
+            src-tauri/gen/android/app/build/outputs/bundle/**/*.aab
 
       - name: Ensure release exists
         env:
@@ -179,13 +278,13 @@ jobs:
               --notes "Automated Android release assets for $TAG"
           fi
 
-      - name: Upload Android release assets
+      - name: Upload signed APKs to release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.resolve-tag.outputs.tag }}
         run: |
           set -euo pipefail
           gh release upload "$TAG" \
-            ${{ steps.collect.outputs.dir }}/* \
+            "${{ steps.sign_apks.outputs.signed_dir }}"/*.apk \
             --repo "${{ github.repository }}" \
             --clobber

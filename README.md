@@ -7,6 +7,24 @@ Cross-platform sync client for hosted [OpenDronelog server](https://github.com/a
 - Desktop: Windows, macOS, Linux (Tauri v2)
 - Mobile: Android APK/AAB (Tauri v2)
 
+## Release Binaries
+
+GitHub Releases contain files prefixed with `opendronelog-sync_<tag>_...`.
+
+### Desktop
+- Linux (`x86_64`): `.AppImage`, `.deb`, `.rpm`, and plain Linux binary artifacts
+- Windows (`x86_64`): `.exe`, `.msi`, and plain Windows binary artifacts
+- macOS Intel (`x86_64`): `.dmg`, `.app.tar.gz`, and plain Darwin binary artifacts
+- macOS Apple Silicon (`aarch64`): `.dmg`, `.app.tar.gz`, and plain Darwin binary artifacts
+
+### Android
+- The Android workflow builds and signs:
+- `opendronelog-sync_<tag>_android-universal.apk`: universal signed APK
+- `opendronelog-sync_<tag>_<abi>_android.apk`: signed ABI-specific APKs (for example `arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`)
+
+### Integrity
+- `checksums.txt` is published with desktop release artifacts for checksum verification.
+
 ## Tech Stack
 
 - React + TypeScript + Vite

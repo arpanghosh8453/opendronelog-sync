@@ -201,12 +201,20 @@ fn stop_sync_watcher(state: tauri::State<'_, AppState>) -> Result<bool, String> 
 }
 
 #[tauri::command]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 fn pick_sync_folder_native() -> Result<Option<String>, String> {
     debug_log("pick_sync_folder_native called");
     let picked = rfd::FileDialog::new().set_title("Select Sync Folder").pick_folder();
     let result = picked.map(|p| p.to_string_lossy().to_string());
     debug_log(&format!("pick_sync_folder_native result={}", result.as_deref().unwrap_or("<cancelled>")));
     Ok(result)
+}
+
+#[tauri::command]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+fn pick_sync_folder_native() -> Result<Option<String>, String> {
+    debug_log("pick_sync_folder_native unsupported on this platform");
+    Ok(None)
 }
 
 #[tauri::command]
