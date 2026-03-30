@@ -7,6 +7,14 @@ Cross-platform sync client for hosted [OpenDronelog server](https://github.com/a
 - Desktop: Windows, macOS, Linux (Tauri v2)
 - Mobile: Android APK/AAB (Tauri v2)
 
+## Screenshots
+
+![Initial Setup](screenshots/setup.png)
+
+![Interface (Dark)](screenshots/interface-dark.png)
+
+![Interface (Light)](screenshots/interface-light.png)
+
 ## Release Binaries
 
 GitHub Releases contain files prefixed with `opendronelog-sync_<tag>_...`.

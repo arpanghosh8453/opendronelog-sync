@@ -2,6 +2,12 @@
   font-family: "Plus Jakarta Sans", "Nunito Sans", sans-serif;
 }
 
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
 html[data-theme="dark"] {
   --bg: #10161d;
   --bg-soft: #16212d;
