@@ -5,11 +5,6 @@ on:
     types: [published]
   workflow_dispatch:
     inputs:
-      branch:
-        description: "Branch to build from for manual dispatch"
-        required: false
-        default: "main"
-        type: string
       build_aab:
         description: "Build split AAB artifacts (optional)"
         required: false
@@ -42,7 +37,7 @@ jobs:
               echo "Unable to resolve latest GitHub release tag for workflow_dispatch"
               exit 1
             fi
-            BRANCH="${{ inputs.branch }}"
+            BRANCH="${{ github.ref_name }}"
             if [ -z "${BRANCH}" ]; then
               BRANCH="main"
             fi
