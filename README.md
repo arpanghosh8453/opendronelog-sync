@@ -1,6 +1,16 @@
-# OpenDroneLog Sync
+<p align="center">
+	<img src="src-tauri/icons/icon.png" alt="OpenDroneLog Sync" width="96" />
+</p>
 
-Cross-platform sync client for hosted [OpenDronelog server](https://github.com/arpanghosh8453/open-dronelog) deployments.
+<H1 align="center"> OpenDroneLog Sync </H1>
+
+<p align="center">
+	<a href="https://github.com/arpanghosh8453/opendronelog-sync/releases">
+		<img src="https://img.shields.io/badge/Download-Latest%20Release-1a7f37?style=for-the-badge&logo=github" alt="Download Latest Release" height="48"/>
+	</a>
+</p>
+
+<p align="center">Cross-platform sync client for hosted <a href="https://github.com/arpanghosh8453/open-dronelog#docker-deployment-self-hosted-web">OpenDronelog server</a> deployments.</p>
 
 ## Platforms
 
@@ -24,6 +34,21 @@ GitHub Releases contain files prefixed with `opendronelog-sync_<tag>_...`.
 - Windows (`x86_64`): `.exe`, `.msi`, and plain Windows binary artifacts
 - macOS Intel (`x86_64`): `.dmg`, `.app.tar.gz`, and plain Darwin binary artifacts
 - macOS Apple Silicon (`aarch64`): `.dmg`, `.app.tar.gz`, and plain Darwin binary artifacts
+
+### macOS Users: "Damaged File" Error Fix
+
+> [!IMPORTANT]
+> If you see a message like "OpenDronelog Sync is damaged and can't be opened" on macOS, this is usually Gatekeeper blocking an unsigned app, not a corrupted download.
+
+Method 1:
+Right-click the app in Finder and select `Open`, then confirm `Open` in the dialog.
+
+Method 2:
+Run this in Terminal (replace with your actual app path):
+
+```bash
+xattr -cr /Applications/OpenDronelog\ Sync.app
+```
 
 ### Android
 - The Android workflow builds and signs:
