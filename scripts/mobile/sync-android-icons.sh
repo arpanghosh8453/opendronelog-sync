@@ -28,31 +28,10 @@ if [[ ! -d "$ANDROID_RES_DIR" ]]; then
   exit 0
 fi
 
-# Copy all Android launcher resources (PNG + XML) from source icons into generated res,
-# preserving relative paths. This keeps adaptive icon resources in sync for AAB builds.
-if [[ -d "$SOURCE_ANDROID_DIR" ]]; then
-  while IFS= read -r source_file; do
-    rel_path="${source_file#"$SOURCE_ANDROID_DIR/"}"
-    target="$ANDROID_RES_DIR/$rel_path"
-    mkdir -p "$(dirname "$target")"
-    cp -f "$source_file" "$target"
-  done < <(find "$SOURCE_ANDROID_DIR" -type f)
-fi
+while IFS= read -r target; do
+  cp -f "$SOURCE_ICON" "$target"
+done < <(find "$ANDROID_RES_DIR" -type f \( -name 'ic_launcher.png' -o -name 'ic_launcher_round.png' -o -name 'ic_launcher_foreground.png' \))
 
-# Ensure generated adaptive icon layers never fall back to Tauri defaults.
-mkdir -p "$ANDROID_RES_DIR/drawable-v24" "$ANDROID_RES_DIR/drawable"
-cat > "$ANDROID_RES_DIR/drawable-v24/ic_launcher_foreground.xml" <<'EOF'
-<?xml version="1.0" encoding="utf-8"?>
-<bitmap xmlns:android="http://schemas.android.com/apk/res/android"
-  android:gravity="center"
-  android:src="@mipmap/ic_launcher_foreground" />
-EOF
-
-cat > "$ANDROID_RES_DIR/drawable/ic_launcher_background.xml" <<'EOF'
-<?xml version="1.0" encoding="utf-8"?>
-<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
-  <solid android:color="#FFFFFF" />
-</shape>
-EOF
+rm -f "$ANDROID_RES_DIR/mipmap-anydpi-v26/ic_launcher.xml" "$ANDROID_RES_DIR/mipmap-anydpi-v26/ic_launcher_round.xml"
 
 echo "Synced generated Android launcher icon assets under: $ANDROID_RES_DIR"
