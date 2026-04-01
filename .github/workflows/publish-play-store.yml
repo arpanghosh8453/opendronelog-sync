@@ -1,0 +1,207 @@
+name: Publish Android AAB to Play Store
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (tag, branch, or commit SHA)"
+        required: false
+        default: "main"
+      package_name:
+        description: "Application ID / package name on Google Play"
+        required: true
+        default: "com.opendronelog.sync"
+      track:
+        description: "Google Play track"
+        required: true
+        default: "alpha"
+        type: choice
+        options:
+          - internal
+          - alpha
+          - beta
+          - production
+      release_status:
+        description: "Release status for the selected track"
+        required: true
+        default: "completed"
+        type: choice
+        options:
+          - draft
+          - inProgress
+          - completed
+      changes_not_sent_for_review:
+        description: "Keep release pending review submission"
+        required: true
+        default: false
+        type: boolean
+      rollout_fraction:
+        description: "Staged rollout fraction for production inProgress (0.0 - 1.0)"
+        required: true
+        default: "1.00"
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  publish-play-store:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      PLAY_STORE_SERVICE_ACCOUNT_JSON: ${{ secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.ref }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Rust targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Validate required secrets
+        run: |
+          set -euo pipefail
+
+          if [ -z "${PLAY_STORE_SERVICE_ACCOUNT_JSON:-}" ]; then
+            echo "Missing secret: PLAY_STORE_SERVICE_ACCOUNT_JSON"
+            exit 1
+          fi
+
+          if [ -z "${ANDROID_KEYSTORE_BASE64:-}" ] || [ -z "${ANDROID_KEY_ALIAS:-}" ] || [ -z "${ANDROID_KEYSTORE_PASSWORD:-}" ]; then
+            echo "Missing required signing secrets: ANDROID_KEYSTORE_BASE64, ANDROID_KEY_ALIAS, ANDROID_KEYSTORE_PASSWORD"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Ensure Tauri CLI
+        run: npm install -g @tauri-apps/cli@^2
+
+      - name: Initialize Android project
+        run: |
+          set -euo pipefail
+
+          if [ ! -d "src-tauri/gen/android" ]; then
+            npm run tauri android init -- --ci
+          else
+            echo "Android project already initialized"
+          fi
+
+      - name: Sync Android launcher icons
+        run: npm run mobile:android:sync-icons
+
+      - name: Apply Android cleartext policy
+        run: npm run mobile:android:apply-cleartext-policy
+
+      - name: Build release AAB (single universal bundle)
+        run: |
+          set -euo pipefail
+          npm run tauri android build -- --aab
+
+      - name: Sign AAB for Play upload
+        id: sign_aab
+        run: |
+          set -euo pipefail
+
+          KEY_PASSWORD="${ANDROID_KEY_PASSWORD:-$ANDROID_KEYSTORE_PASSWORD}"
+          KEYSTORE_PATH="$RUNNER_TEMP/upload-keystore.jks"
+          SIGNED_DIR="$RUNNER_TEMP/signed-aab"
+          AAB_OUTPUT_DIR="src-tauri/gen/android/app/build/outputs/bundle"
+
+          mkdir -p "$SIGNED_DIR"
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$KEYSTORE_PATH"
+
+          mapfile -t UNSIGNED_AABS < <(find "$AAB_OUTPUT_DIR" -type f -name '*-unsigned.aab' | sort)
+          if [ "${#UNSIGNED_AABS[@]}" -gt 0 ]; then
+            INPUT_AAB="${UNSIGNED_AABS[0]}"
+          else
+            mapfile -t RELEASE_AABS < <(find "$AAB_OUTPUT_DIR" -type f -name '*.aab' | sort)
+            if [ "${#RELEASE_AABS[@]}" -eq 0 ]; then
+              echo "No AAB was found in $AAB_OUTPUT_DIR"
+              exit 1
+            fi
+            INPUT_AAB="${RELEASE_AABS[0]}"
+            echo "No *-unsigned.aab found; using $INPUT_AAB"
+          fi
+
+          OUTPUT_AAB="$SIGNED_DIR/opendronelog-sync-play-release.aab"
+          cp "$INPUT_AAB" "$OUTPUT_AAB"
+
+          jarsigner \
+            -keystore "$KEYSTORE_PATH" \
+            -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+            -keypass "$KEY_PASSWORD" \
+            "$OUTPUT_AAB" \
+            "$ANDROID_KEY_ALIAS"
+
+          jarsigner -verify "$OUTPUT_AAB"
+
+          echo "signed_aab=$OUTPUT_AAB" >> "$GITHUB_OUTPUT"
+
+      - name: Upload signed AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-aab-release-signed
+          path: ${{ steps.sign_aab.outputs.signed_aab }}
+
+      - name: Resolve Play publishing parameters
+        id: publish_params
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "release" ]; then
+            # Default automatic release behavior: full production rollout.
+            PACKAGE_NAME="com.opendronelog.sync"
+            TRACK="production"
+            RELEASE_STATUS="completed"
+            CHANGES_NOT_SENT_FOR_REVIEW="false"
+            ROLLOUT_FRACTION="1.00"
+          else
+            PACKAGE_NAME="${{ inputs.package_name }}"
+            TRACK="${{ inputs.track }}"
+            RELEASE_STATUS="${{ inputs.release_status }}"
+            CHANGES_NOT_SENT_FOR_REVIEW="${{ inputs.changes_not_sent_for_review }}"
+            ROLLOUT_FRACTION="${{ inputs.rollout_fraction }}"
+          fi
+
+          echo "package_name=$PACKAGE_NAME" >> "$GITHUB_OUTPUT"
+          echo "track=$TRACK" >> "$GITHUB_OUTPUT"
+          echo "release_status=$RELEASE_STATUS" >> "$GITHUB_OUTPUT"
+          echo "changes_not_sent_for_review=$CHANGES_NOT_SENT_FOR_REVIEW" >> "$GITHUB_OUTPUT"
+          echo "rollout_fraction=$ROLLOUT_FRACTION" >> "$GITHUB_OUTPUT"
+
+      - name: Upload AAB to Google Play
+        uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_STORE_SERVICE_ACCOUNT_JSON }}
+          packageName: ${{ steps.publish_params.outputs.package_name }}
+          releaseFiles: ${{ steps.sign_aab.outputs.signed_aab }}
+          track: ${{ steps.publish_params.outputs.track }}
+          status: ${{ steps.publish_params.outputs.release_status }}
+          userFraction: ${{ steps.publish_params.outputs.release_status == 'inProgress' && steps.publish_params.outputs.rollout_fraction || '' }}
+          changesNotSentForReview: ${{ steps.publish_params.outputs.changes_not_sent_for_review }}
