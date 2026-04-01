@@ -134,6 +134,9 @@ jobs:
       - name: Sync Android launcher icons
         run: npm run mobile:android:sync-icons
 
+      - name: Apply Android cleartext policy
+        run: npm run mobile:android:apply-cleartext-policy
+
       - name: Build release APKs (universal and split)
         id: build_apks
         run: |
