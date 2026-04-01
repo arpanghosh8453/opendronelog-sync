@@ -151,6 +151,7 @@ jobs:
         if: ${{ inputs.build_aab }}
         run: |
           set -euo pipefail
+          npm run mobile:android:sync-icons
           npm run tauri android build -- --aab --split-per-abi
 
       - name: Ensure Android signing tools

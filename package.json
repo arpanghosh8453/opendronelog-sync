@@ -10,9 +10,9 @@
     "tauri": "tauri",
     "mobile:android:sync-icons": "bash ./scripts/mobile/sync-android-icons.sh",
     "mobile:android:apply-cleartext-policy": "bash ./scripts/mobile/apply-android-cleartext-policy.sh",
-    "mobile:android:init": "npm run tauri -- android init --ci && npm run mobile:android:apply-cleartext-policy",
-    "mobile:android:build:aab": "npm run mobile:android:apply-cleartext-policy && npm run tauri -- android build --aab",
-    "mobile:android:build:apk": "npm run mobile:android:apply-cleartext-policy && npm run tauri -- android build --apk"
+    "mobile:android:init": "npm run tauri -- android init --ci && npm run mobile:android:sync-icons && npm run mobile:android:apply-cleartext-policy",
+    "mobile:android:build:aab": "npm run mobile:android:sync-icons && npm run mobile:android:apply-cleartext-policy && npm run tauri -- android build --aab",
+    "mobile:android:build:apk": "npm run mobile:android:sync-icons && npm run mobile:android:apply-cleartext-policy && npm run tauri -- android build --apk"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
