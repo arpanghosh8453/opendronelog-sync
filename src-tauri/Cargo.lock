@@ -2585,6 +2585,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-android-fs",
+ "tauri-plugin-bgsync",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
  "walkdir",
@@ -4334,6 +4335,16 @@ dependencies = [
  "tauri-plugin",
  "tauri-plugin-fs",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "tauri-plugin-bgsync"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-plugin",
 ]
 
 [[package]]

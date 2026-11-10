@@ -1,0 +1,17 @@
+[package]
+name = "tauri-plugin-bgsync"
+version = "0.1.0"
+description = "Android background sync and opt-in saved login for OpenDronelog Sync"
+edition = "2021"
+license = "AGPL-3.0"
+publish = false
+build = "build.rs"
+links = "tauri-plugin-bgsync"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+tauri-plugin = { version = "2", features = ["build"] }

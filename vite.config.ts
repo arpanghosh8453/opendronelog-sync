@@ -8,6 +8,12 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react()],
 
+  // Older Android controllers (and the stock Android 10 emulator, WebView 74) can't parse
+  // `?.` / `??`; compile down so the UI doesn't load as a blank screen there.
+  build: {
+    target: ["es2019", "chrome74"],
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

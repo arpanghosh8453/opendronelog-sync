@@ -433,6 +433,11 @@ button:disabled .inline-spinner {
   margin: 0.8rem 0;
 }
 
+.sync-summary {
+  margin: 0.6rem 0 0.2rem;
+  font-weight: 600;
+}
+
 @keyframes spin {
   from {
     transform: rotate(0deg);
@@ -518,4 +523,82 @@ button:disabled .inline-spinner {
   .cell-action {
     justify-content: flex-end;
   }
+}
+
+/* Android background sync + saved login */
+.check-row {
+  display: flex;
+  gap: 0.6rem;
+  align-items: flex-start;
+  margin: 0.6rem 0;
+  text-align: left;
+  cursor: pointer;
+}
+
+.check-row input[type="checkbox"] {
+  width: auto;
+  margin-top: 0.2rem;
+  flex: none;
+}
+
+.check-row small,
+.hint {
+  display: block;
+  color: var(--muted);
+  font-size: 0.8rem;
+  margin-top: 0.2rem;
+}
+
+.bg-settings {
+  flex-basis: 100%;
+  border-top: 1px solid var(--border);
+  padding-top: 0.6rem;
+}
+
+.bg-settings h3 {
+  margin: 0 0 0.2rem;
+  font-size: 1rem;
+}
+
+.bg-status {
+  list-style: none;
+  padding: 0;
+  margin: 0.4rem 0 0.8rem;
+  display: grid;
+  gap: 0.4rem;
+  font-size: 0.9rem;
+}
+
+.bg-status li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  align-items: center;
+}
+
+.bg-status .warn {
+  color: #e8a33d;
+}
+
+.folder-finder {
+  margin: 0.6rem 0;
+}
+
+.found-folders {
+  list-style: none;
+  padding: 0;
+  margin: 0.6rem 0 0;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.found-folders li {
+  display: flex;
+  gap: 0.6rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.found-folders small {
+  overflow-wrap: anywhere;
 }

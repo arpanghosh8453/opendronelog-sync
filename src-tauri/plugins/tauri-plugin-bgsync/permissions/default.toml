@@ -1,0 +1,16 @@
+"$schema" = "schemas/schema.json"
+
+[default]
+description = "Allows the app to configure Android background sync, read its status and use the opt-in saved login."
+permissions = [
+  "allow-configure",
+  "allow-get-status",
+  "allow-relogin",
+  "allow-clear-password",
+  "allow-request-storage-access",
+  "allow-sync-now",
+  "allow-find-log-folders",
+  "allow-grant-folder-access",
+  "allow-scan-folder",
+  "allow-upload-file",
+]

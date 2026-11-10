@@ -16,8 +16,24 @@ import {
   User,
 } from "lucide-react";
 import { getAllowedExtensions, getServerFileHashes, getSyncBlacklist, listProfiles, switchProfile } from "./lib/api";
-import { normalizeServerUrl, isLikelyMobile } from "./lib/platform";
+import { normalizeServerUrl, isLikelyMobile, serverUrlProblem } from "./lib/platform";
 import { loadConfig, saveConfig, type AppConfig } from "./lib/storage";
+import {
+  backgroundSyncNow,
+  clearSavedPassword,
+  configureBgSync,
+  findLogFolders,
+  getBgSyncStatus,
+  grantFolderAccess,
+  isNativeFolder,
+  scanNativeFolder,
+  uploadNativeFile,
+  isAndroid,
+  reloginWithSavedPassword,
+  requestStorageAccess,
+  type BgSyncStatus,
+  type FoundLogFolder,
+} from "./lib/bgsync";
 import type { LocalFileEntry, ProfileInfo, SyncItem, UploadSyncResponse } from "./types";
 import "./App.css";
 
@@ -89,6 +105,8 @@ function App() {
   const [folderInput, setFolderInput] = useState(config.syncFolder);
   const [allowedExtensions, setAllowedExtensions] = useState<string[]>([]);
   const [files, setFiles] = useState<SyncItem[]>([]);
+  // Whether the file list reflects a finished check, so an empty list isn't shown as "no logs".
+  const [scanState, setScanState] = useState<"pending" | "ready" | "failed">("pending");
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [showSettings, setShowSettings] = useState(false);
@@ -122,6 +140,12 @@ function App() {
   const mobileFilePayloadByPathRef = useRef<Record<string, MobileFilePayload>>({});
   const recentlyUploadedHashesRef = useRef<Set<string>>(new Set());
   const mobile = useMemo(() => isLikelyMobile(), []);
+  const android = useMemo(() => isAndroid(), []);
+  const [bgStatus, setBgStatus] = useState<BgSyncStatus | null>(null);
+  const [rememberInput, setRememberInput] = useState(config.rememberPassword);
+  const refreshAfterReloginRef = useRef(false);
+  const [foundFolders, setFoundFolders] = useState<FoundLogFolder[] | null>(null);
+  const [searchingFolders, setSearchingFolders] = useState(false);
   const isRefreshInProgress = refreshClickIntent || syncProgress.active || refreshActiveCount > 0 || refreshQueueCount > 0;
   const isSyncInProgress = syncClickIntent || isSyncNowRunning || uploadingPath.length > 0;
 
@@ -148,6 +172,51 @@ function App() {
   useEffect(() => {
     authContextRef.current = buildAuthContext(config.serverUrl, config.activeProfile, config.sessionToken);
   }, [config.serverUrl, config.activeProfile, config.sessionToken]);
+
+  // Keep the Android background service's copy of the settings in step with the UI.
+  useEffect(() => {
+    if (!android) return;
+    configureBgSync({
+      serverUrl: config.serverUrl,
+      profile: config.activeProfile,
+      sessionToken: config.sessionToken,
+      folder: config.syncFolder,
+      autoSync: config.autoSync,
+      rememberPassword: config.rememberPassword,
+    })
+      .then(setBgStatus)
+      .catch((err) => debugLog("bgsync.configure.failed", { error: asError(err) }));
+  }, [android, config.serverUrl, config.activeProfile, config.sessionToken, config.syncFolder, config.autoSync, config.rememberPassword]);
+
+  // Refresh the background status whenever settings are opened, and when returning to the app
+  // (e.g. from the "All files access" screen).
+  useEffect(() => {
+    if (!android) return;
+    const update = () => {
+      getBgSyncStatus()
+        .then(setBgStatus)
+        .catch(() => undefined);
+    };
+    update();
+    document.addEventListener("visibilitychange", update);
+    return () => document.removeEventListener("visibilitychange", update);
+  }, [android, showSettings]);
+
+  // On Android, look for the DJI log folder as soon as the folder screen opens with nothing chosen yet.
+  useEffect(() => {
+    if (android && screen === "folder" && !folderInput.trim()) {
+      void findDjiFolders(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [android, screen]);
+
+  // After an automatic re-login, rerun the sync check with the new token.
+  useEffect(() => {
+    if (!refreshAfterReloginRef.current || !config.sessionToken || screen !== "dashboard") return;
+    refreshAfterReloginRef.current = false;
+    void refreshSyncState(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [config.sessionToken, screen]);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", config.theme);
@@ -245,6 +314,30 @@ function App() {
     debugLog("watcher.cleanup.done");
   }
 
+  /**
+   * On a 401, try one re-login with the saved password (Android, opt-in only).
+   * Returns true if a new session was obtained; the caller should then stop and let the
+   * refresh-after-relogin effect rerun the sync check with the new token.
+   */
+  async function tryAutoRelogin(): Promise<boolean> {
+    if (!android || !config.rememberPassword) return false;
+    try {
+      debugLog("session.autoRelogin.start");
+      const token = await reloginWithSavedPassword();
+      refreshAfterReloginRef.current = true;
+      setConfig((prev) => ({ ...prev, sessionToken: token }));
+      setMessage("Session expired and was renewed automatically.");
+      debugLog("session.autoRelogin.done");
+      return true;
+    } catch (err) {
+      debugLog("session.autoRelogin.failed", { error: asError(err) });
+      getBgSyncStatus()
+        .then(setBgStatus)
+        .catch(() => undefined);
+      return false;
+    }
+  }
+
   async function ensureAllowedExtensions(): Promise<string[]> {
     if (allowedExtensions.length) {
       return allowedExtensions;
@@ -266,6 +359,15 @@ function App() {
       }
 
       const normalized = normalizeServerUrl(config.serverUrl);
+      const urlProblem = serverUrlProblem(normalized);
+      if (urlProblem) {
+        // Saved by an older version that allowed it: ask for a safe address instead.
+        debugLog("app.init.unsafeServerUrl");
+        setServerInput(normalized);
+        setMessage(urlProblem);
+        setScreen("server");
+        return;
+      }
       setInitProgress({ percent: 35, label: "Fetching profiles..." });
       try {
         debugLog("profiles.fetch.start", { serverUrl: normalized });
@@ -294,6 +396,11 @@ function App() {
         } catch (err) {
           if (isUnauthorized(err)) {
             debugLog("session.restore.expired");
+            if (await tryAutoRelogin()) {
+              setScreen(config.syncFolder ? "dashboard" : "folder");
+              setInitProgress({ percent: 100, label: "Ready" });
+              return;
+            }
             setConfig((prev) => ({ ...prev, sessionToken: "" }));
             setScreen("login");
             setMessage("Session expired. Please login again.");
@@ -357,6 +464,11 @@ function App() {
       setMessage("Enter a valid server URL.");
       return;
     }
+    const urlProblem = serverUrlProblem(clean);
+    if (urlProblem) {
+      setMessage(urlProblem);
+      return;
+    }
     debugLog("serverUrl.save.start", { value: clean });
     setBusy(true);
     setMessage("Connecting to server...");
@@ -375,6 +487,7 @@ function App() {
       setSyncProgress({ active: false, percent: 0, label: "" });
       setAllowedExtensions([]);
       setFiles([]);
+      setScanState("pending");
       setUploadingPath("");
       recentlyUploadedHashesRef.current.clear();
       setFolderInput("");
@@ -408,10 +521,31 @@ function App() {
       debugLog("login.start", { profile: selectedProfile, hasPassword: Boolean(password) });
       const result = await switchProfile(config.serverUrl, selectedProfile, password);
       const nextToken = result.session ?? "";
+      const remember = android && rememberInput && Boolean(password);
+      if (android) {
+        // Hand the password to the native side (Keystore-encrypted) only when the user opted in.
+        // Not remembering clears any previously saved password.
+        try {
+          setBgStatus(
+            await configureBgSync({
+              serverUrl: config.serverUrl,
+              profile: result.name,
+              sessionToken: nextToken,
+              folder: config.syncFolder,
+              autoSync: config.autoSync,
+              rememberPassword: remember,
+              password: remember ? password : undefined,
+            }),
+          );
+        } catch (err) {
+          debugLog("bgsync.savePassword.failed", { error: asError(err) });
+        }
+      }
       setConfig((prev) => ({
         ...prev,
         activeProfile: result.name,
         sessionToken: nextToken,
+        rememberPassword: remember,
       }));
       const exts = await getAllowedExtensions(config.serverUrl, result.name, nextToken);
       setAllowedExtensions(exts);
@@ -479,6 +613,69 @@ function App() {
     }
   }
 
+  /**
+   * Looks for DJI FlightRecord folders on the controller. Picks the folder automatically when
+   * there is exactly one readable match; otherwise lists them. `userAsked` asks for storage
+   * access if it is missing (the automatic run on screen open never prompts).
+   */
+  async function findDjiFolders(userAsked: boolean): Promise<void> {
+    if (!android) return;
+    setSearchingFolders(true);
+    try {
+      const status = await getBgSyncStatus();
+      setBgStatus(status);
+      if (!status.storageAccess) {
+        if (userAsked) {
+          setBgStatus(await requestStorageAccess());
+          setMessage('Allow "All files access" for OpenDronelog Sync, then tap "Find DJI log folder" again.');
+        }
+        return;
+      }
+      const { folders } = await findLogFolders();
+      setFoundFolders(folders);
+      const readable = folders.filter((f) => f.readable);
+      const blocked = folders.filter((f) => !f.readable);
+      if (readable.length >= 1) {
+        // Best match first: most recent logs.
+        setMobileSyncUri(null);
+        setFolderInput(readable[0].path);
+        const best = readable[0];
+        const what =
+          best.logCount > 0
+            ? `${best.logCount} DJI flight log${best.logCount === 1 ? "" : "s"} (newest ${best.newestLogName})`
+            : "an empty DJI log folder";
+        setMessage(
+          readable.length === 1
+            ? `Found ${what} in ${best.path}. Tap Save Folder.`
+            : `Found ${readable.length} possible folders. Picked the one with ${what}; choose another below if needed.`,
+        );
+      } else if (blocked.length) {
+        setMessage(
+          `Found ${describeApp(blocked[0].app)}'s log folder (${blocked[0].path}). Android needs you to allow access once: tap "Grant access" below, then "Allow access" in the picker.`,
+        );
+      } else if (userAsked) {
+        setMessage("No DJI flight log folder found. Fly once so the DJI app creates it, or use Browse.");
+      }
+    } catch (err) {
+      debugLog("folder.find.failed", { error: asError(err) });
+      if (userAsked) setMessage(asError(err));
+    } finally {
+      setSearchingFolders(false);
+    }
+  }
+
+  /** Asks Android's folder picker for access to a folder the app can't read directly (DJI Fly on Android 11+). */
+  async function grantBlockedFolder(f: FoundLogFolder): Promise<void> {
+    try {
+      const folder = await grantFolderAccess(f.path);
+      setMobileSyncUri(null);
+      setFolderInput(folder);
+      setMessage(`Access granted to ${describeApp(f.app)}'s log folder. Tap Save Folder.`);
+    } catch (err) {
+      setMessage(asError(err));
+    }
+  }
+
   async function saveFolder(): Promise<void> {
     if (!folderInput.trim()) {
       setMessage("Select or enter a sync folder.");
@@ -486,7 +683,7 @@ function App() {
     }
 
     const selectedFolder = folderInput.trim();
-    if (mobile && isContentUri(selectedFolder) && !getMobileSyncUri()) {
+    if (mobile && isContentUri(selectedFolder) && !getMobileSyncUri() && !isNativeFolder(selectedFolder)) {
       setMessage("Please browse and grant folder access again.");
       return;
     }
@@ -535,7 +732,14 @@ function App() {
       setAllowedExtensions(exts);
 
       let localPromise: Promise<LocalFileEntry[]>;
-      if (mobile && isContentUri(folderPath)) {
+      if (android && isNativeFolder(folderPath)) {
+        // Folder granted through Android's picker (e.g. DJI Fly's logs): read it natively.
+        setSyncProgress({ active: true, percent: 35, label: "Scanning DJI log folder..." });
+        localPromise = scanNativeFolder(folderPath, exts).then((result) => {
+          setSyncProgress({ active: true, percent: 60, label: "Fetched local files." });
+          return result;
+        });
+      } else if (mobile && isContentUri(folderPath)) {
         localPromise = (async () => {
           setSyncProgress({ active: true, percent: 35, label: "Scanning selected mobile folder..." });
           const androidFs = await loadAndroidFsModule();
@@ -649,6 +853,7 @@ function App() {
       });
 
       setFiles(nextItems);
+      setScanState("ready");
       setMessage("");
       setSyncProgress({ active: true, percent: 100, label: "Sync view ready." });
       debugLog("sync.refresh.done", {
@@ -668,11 +873,15 @@ function App() {
           return [];
         }
         debugLog("sync.refresh.unauthorized");
+        if (await tryAutoRelogin()) {
+          return [];
+        }
         setConfig((prev) => ({ ...prev, sessionToken: "" }));
         setScreen("login");
         setMessage("Session expired. Please login again.");
       } else {
         debugLog("sync.refresh.failed", { error: asError(err) });
+        setScanState((prev) => (prev === "ready" ? prev : "failed"));
         setMessage(asError(err));
       }
       return [];
@@ -726,12 +935,15 @@ function App() {
         setUploadingPath(file.path);
         setFiles((prev) => prev.map((item) => (item.path === file.path ? { ...item, status: "uploading" } : item)));
 
+        const nativeFolder = android && isNativeFolder(config.syncFolder);
         const mobilePayload = mobileFilePayloadByPathRef.current[file.path];
-        if (isContentUri(file.path) && !mobilePayload) {
+        if (!nativeFolder && isContentUri(file.path) && !mobilePayload) {
           throw new Error(`Missing mobile file payload for ${file.name}. Refresh and try again.`);
         }
 
-        const result = isContentUri(file.path)
+        const result = nativeFolder
+          ? await uploadNativeFile(file.path)
+          : isContentUri(file.path)
           ? await uploadMobileFile(
               config.serverUrl,
               config.activeProfile,
@@ -749,6 +961,10 @@ function App() {
 
         if (result.statusCode === 401) {
           debugLog("sync.manual.upload.unauthorized", { file: file.path });
+          if (await tryAutoRelogin()) {
+            setMessage("Session was renewed automatically. Tap Sync Now again to finish uploading.");
+            return;
+          }
           setConfig((prev) => ({ ...prev, sessionToken: "" }));
           setScreen("login");
           setMessage("Session expired. Please login again.");
@@ -790,6 +1006,7 @@ function App() {
     setFolderInput("");
     setAllowedExtensions([]);
     setFiles([]);
+    setScanState("pending");
     setConfig((prev) => ({ ...prev, activeProfile: "", sessionToken: "", syncFolder: "" }));
     setScreen("login");
   }
@@ -829,6 +1046,22 @@ function App() {
             placeholder="Profile password"
           />
         ) : null}
+        {android && selected?.hasPassword ? (
+          <label className="check-row">
+            <input
+              type="checkbox"
+              checked={rememberInput}
+              onChange={(e) => setRememberInput(e.target.checked)}
+            />
+            <span>
+              Remember password on this device
+              <small>
+                Stored encrypted with the Android Keystore and only used to log in again when the session
+                expires. If it's ever rejected, it's deleted and you'll be asked to log in.
+              </small>
+            </span>
+          </label>
+        ) : null}
         <button disabled={busy} onClick={() => void handleLogin()}>Login</button>
       </section>
     );
@@ -843,6 +1076,46 @@ function App() {
           <input value={folderInput} onChange={(e) => setFolderInput(e.target.value)} placeholder="/path/to/sync-folder" />
           <button className="ghost" onClick={() => void pickFolder()}>Browse</button>
         </div>
+        {android ? (
+          <div className="folder-finder">
+            <button className="ghost" disabled={searchingFolders} onClick={() => void findDjiFolders(true)}>
+              {searchingFolders ? <><span className="inline-spinner" aria-hidden="true" /> Searching…</> : "Find DJI log folder"}
+            </button>
+            {bgStatus && !bgStatus.storageAccess ? (
+              <small className="hint">Needs "All files access" to read DJI's log folder.</small>
+            ) : null}
+            {foundFolders && foundFolders.length > 0 ? (
+              <ul className="found-folders">
+                {foundFolders.map((f) => (
+                  <li key={f.path}>
+                    <button
+                      className={folderInput === f.path ? "" : "ghost"}
+                      onClick={() => {
+                        if (f.readable) {
+                          setMobileSyncUri(null);
+                          setFolderInput(f.path);
+                        } else {
+                          void grantBlockedFolder(f);
+                        }
+                      }}
+                    >
+                      {f.readable ? describeApp(f.app) : `Grant access (${describeApp(f.app)})`}
+                    </button>
+                    <small className="hint">
+                      {f.path}
+                      <br />
+                      {!f.readable
+                        ? 'Android blocks direct access. Tap "Grant access", then "Allow access" in the picker.'
+                        : f.logCount === 0
+                          ? "No DJI flight logs in here yet."
+                          : `${f.logCount} DJI flight log${f.logCount === 1 ? "" : "s"} · newest: ${f.newestLogName} (${new Date(f.newestLogMs).toLocaleString()})`}
+                    </small>
+                  </li>
+                ))}
+              </ul>
+            ) : null}
+          </div>
+        ) : null}
         <button disabled={busy} onClick={() => void saveFolder()}>Save Folder</button>
       </section>
     );
@@ -885,9 +1158,11 @@ function App() {
 
         <div className="meta">
           <span>Profile: {config.activeProfile}</span>
-          <span>Folder: {config.syncFolder}</span>
+          <span title={config.syncFolder}>Folder: {displayFolder(config.syncFolder)}</span>
           <span>Allowed: {allowedExtensions.join(", ") || "-"}</span>
         </div>
+
+        {files.length ? <p className="sync-summary">{syncSummary(files)}</p> : null}
 
         <div className="table">
           {files.length ? STATUS_ORDER.map((status) => {
@@ -939,9 +1214,100 @@ function App() {
                 ) : null}
               </section>
             );
-          }) : <p className="empty">No matching files found in the sync folder.</p>}
+          }) : <p className="empty">{
+            scanState === "pending"
+              ? "Checking the folder and the server…"
+              : scanState === "failed"
+                ? "Couldn't finish checking the folder and the server. Tap Refresh to try again."
+                : "No flight logs in this folder yet. If you've already flown, check the folder in Settings."
+          }</p>}
         </div>
       </section>
+    );
+  }
+
+  function renderBackgroundSettings() {
+    const status = bgStatus;
+    // Plain paths and picker-granted folders can both be read by the background service.
+    const folderIsPath = Boolean(config.syncFolder);
+    return (
+      <div className="bg-settings">
+        <h3>Background sync</h3>
+        <label className="check-row">
+          <input
+            type="checkbox"
+            checked={config.autoSync}
+            disabled={!config.activeProfile}
+            onChange={(e) => {
+              const autoSync = e.target.checked;
+              setConfig((prev) => ({ ...prev, autoSync }));
+              if (autoSync && status && !status.storageAccess) {
+                void requestStorageAccess().then(setBgStatus).catch((err) => setMessage(asError(err)));
+              }
+            }}
+          />
+          <span>
+            Sync in the background and start when the controller turns on
+            <small>Shows a small "OpenDronelog Sync" notification while running. Logs upload about 2 minutes after a flight ends.</small>
+          </span>
+        </label>
+
+        {status ? (
+          <ul className="bg-status">
+            <li>
+              Storage access: {status.storageAccess ? "granted" : "not granted"}
+              {!status.storageAccess ? (
+                <button
+                  className="ghost"
+                  onClick={() => void requestStorageAccess().then(setBgStatus).catch((err) => setMessage(asError(err)))}
+                >
+                  Grant all files access
+                </button>
+              ) : null}
+            </li>
+            {config.autoSync && !folderIsPath ? (
+              <li className="warn">Background sync needs a sync folder. Use "Change Sync Folder", then "Find DJI log folder".</li>
+            ) : null}
+            <li>Service: {status.serviceRunning ? "running" : "stopped"}</li>
+            <li>
+              Saved password: {status.hasSavedPassword ? "yes (encrypted)" : "no"}
+              {status.hasSavedPassword ? (
+                <button
+                  className="ghost"
+                  onClick={() => {
+                    setConfig((prev) => ({ ...prev, rememberPassword: false }));
+                    setRememberInput(false);
+                    void clearSavedPassword().then(setBgStatus).catch((err) => setMessage(asError(err)));
+                  }}
+                >
+                  Forget password
+                </button>
+              ) : null}
+            </li>
+            {status.needsLogin ? (
+              <li className="warn">Login needed: the session expired and there's no valid saved password. Use "Change Profile" to log in.</li>
+            ) : null}
+            <li className={status.lastSyncOk ? "" : "warn"}>
+              Last background sync: {status.lastSyncMessage || "not run yet"}
+            </li>
+          </ul>
+        ) : null}
+
+        <button
+          className="ghost"
+          disabled={!config.activeProfile}
+          onClick={() =>
+            void backgroundSyncNow()
+              .then((s) => {
+                setBgStatus(s);
+                setMessage("Background sync started.");
+              })
+              .catch((err) => setMessage(asError(err)))
+          }
+        >
+          Run background sync now
+        </button>
+      </div>
     );
   }
 
@@ -986,6 +1352,7 @@ function App() {
           <button className="ghost" onClick={() => setScreen("server")}>Change Server URL</button>
           <button className="ghost" onClick={resetLogin}>Change Profile</button>
           <button className="ghost" onClick={() => setScreen("folder")}>Change Sync Folder</button>
+          {android ? renderBackgroundSettings() : null}
         </section>
       ) : null}
 
@@ -997,6 +1364,48 @@ function App() {
       {screen === "dashboard" ? renderDashboard() : null}
     </main>
   );
+}
+
+function describeApp(app: string): string {
+  if (app === "com.dji.industry.pilot") return "DJI Pilot 2";
+  if (app === "dji.go.v5") return "DJI Fly";
+  if (app === "dji.go.v4") return "DJI GO 4";
+  return app || "Log folder";
+}
+
+/** One line saying where the folder stands, so "everything uploaded" reads differently from "nothing found". */
+function syncSummary(files: SyncItem[]): string {
+  const count = (s: SyncItem["status"]) => files.filter((f) => f.status === s).length;
+  const waiting = count("pending") + count("uploading");
+  const logs = (n: number) => `${n} flight log${n === 1 ? "" : "s"}`;
+  if (waiting > 0 && waiting === files.length) return `All ${logs(files.length)} in this folder are waiting to upload.`;
+  if (waiting > 0) return `${logs(waiting)} waiting to upload, out of ${logs(files.length)} in this folder.`;
+  return `All ${logs(files.length)} in this folder are on the server. Nothing new to upload.`;
+}
+
+/**
+ * Readable name for a sync folder. Folder-picker grants are content:// tree URIs such as
+ * content://com.android.externalstorage.documents/tree/primary%3AAndroid%2Fdata%2Fdji.go.v5%2Ffiles%2FFlightRecord,
+ * shown as "DJI Fly · FlightRecord". Plain paths are returned as they are.
+ */
+function displayFolder(folder: string): string {
+  const match = /^content:\/\/[^/]+\/tree\/([^/]+)/.exec(folder);
+  if (!match) return folder;
+  let docId: string;
+  try {
+    docId = decodeURIComponent(match[1]);
+  } catch {
+    return folder;
+  }
+  const colon = docId.indexOf(":");
+  const volume = colon >= 0 ? docId.slice(0, colon) : "";
+  const path = colon >= 0 ? docId.slice(colon + 1) : docId;
+  const parts = path.split("/").filter(Boolean);
+  const name = parts[parts.length - 1] || "storage root";
+  const appData = /^Android\/data\/([^/]+)\//.exec(path + "/");
+  if (appData) return `${describeApp(appData[1])} · ${name}`;
+  const storage = volume === "primary" ? "Internal storage" : volume ? `SD card (${volume})` : "Storage";
+  return path ? `${storage} › ${parts.join(" › ")}` : storage;
 }
 
 function asError(err: unknown): string {
