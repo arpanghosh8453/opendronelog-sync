@@ -357,6 +357,52 @@ fn scan_sync_folder(folder_path: String, allowed_extensions: Vec<String>) -> Res
     Ok(files)
 }
 
+/// HTTP client for uploads. Without time limits a request the server never answers waits
+/// forever and blocks "Sync Now"; these match the background service's limits.
+/// True for hosts that can't be reached from the public internet: this device,
+/// private (RFC 1918), carrier-grade NAT (Tailscale), link-local and IPv6
+/// unique-local addresses, and .local / .lan / .home.arpa / .internal names.
+/// Keep in step with isLocalNetworkHost in src/lib/platform.ts and OdlClient.kt.
+fn is_local_network_host(url: &reqwest::Url) -> bool {
+    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    let host = host.trim_start_matches('[').trim_end_matches(']').trim_end_matches('.');
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => {
+            let [a, b, _, _] = ip.octets();
+            ip.is_loopback() || ip.is_private() || ip.is_link_local() || (a == 100 && (64..=127).contains(&b))
+        }
+        Ok(std::net::IpAddr::V6(ip)) => {
+            let first = ip.segments()[0];
+            ip.is_loopback() || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
+        }
+        Err(_) => {
+            host == "localhost"
+                || [".localhost", ".local", ".lan", ".home.arpa", ".internal"]
+                    .iter()
+                    .any(|suffix| host.ends_with(suffix))
+        }
+    }
+}
+
+/// Passwords and session tokens go to this address: https:// anywhere,
+/// plain http:// only on the local network.
+fn check_server_url(base: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(base).map_err(|_| format!("Invalid server URL: {}", base))?;
+    match url.scheme() {
+        "https" => Ok(()),
+        "http" if is_local_network_host(&url) => Ok(()),
+        _ => Err("Use https:// for this server. Plain http:// is only allowed on your own network.".to_string()),
+    }
+}
+
+fn upload_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {}", e))
+}
+
 #[tauri::command]
 async fn upload_sync_file(
     server_url: String,
@@ -375,6 +421,7 @@ async fn upload_sync_file(
         debug_log("upload_sync_file failed: missing server URL");
         return Err("Missing server URL".to_string());
     }
+    check_server_url(clean_base)?;
 
     let file_path = PathBuf::from(file_path.trim());
     if !file_path.exists() {
@@ -395,7 +442,7 @@ async fn upload_sync_file(
     let file_part = multipart::Part::bytes(bytes).file_name(file_name);
     let form = multipart::Form::new().part("file", file_part);
 
-    let client = reqwest::Client::new();
+    let client = upload_client()?;
     let mut request = client
         .post(format!("{}/api/import", clean_base))
         .header("X-Profile", profile)
@@ -449,6 +496,7 @@ async fn upload_sync_file_bytes(
         debug_log("upload_sync_file_bytes failed: missing server URL");
         return Err("Missing server URL".to_string());
     }
+    check_server_url(clean_base)?;
 
     if file_bytes.is_empty() {
         return Err("Selected mobile file is empty or unavailable".to_string());
@@ -464,7 +512,7 @@ async fn upload_sync_file_bytes(
     let file_part = multipart::Part::bytes(file_bytes).file_name(safe_name);
     let form = multipart::Form::new().part("file", file_part);
 
-    let client = reqwest::Client::new();
+    let client = upload_client()?;
     let mut request = client
         .post(format!("{}/api/import", clean_base))
         .header("X-Profile", profile)
@@ -519,6 +567,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_android_fs::init())
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_bgsync::init())
         .invoke_handler(tauri::generate_handler![
             scan_sync_folder,
             upload_sync_file,
@@ -530,4 +579,38 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod server_url_tests {
+    use super::check_server_url;
+
+    #[test]
+    fn https_anywhere_http_only_on_the_local_network() {
+        for ok in [
+            "https://logs.example.com",
+            "http://localhost:3001",
+            "http://127.0.0.1",
+            "http://192.168.1.20:8080",
+            "http://10.0.0.5",
+            "http://172.20.1.1",
+            "http://100.101.102.103",
+            "http://nas.local",
+            "http://odl.home.arpa",
+            "http://[fd00::1]:3001",
+        ] {
+            assert!(check_server_url(ok).is_ok(), "{} was refused", ok);
+        }
+        for bad in [
+            "http://logs.example.com",
+            "http://8.8.8.8",
+            "http://172.32.0.1",
+            "http://192.168.1.20.example.com",
+            "http://local.example.com",
+            "ftp://192.168.1.20",
+            "not a url",
+        ] {
+            assert!(check_server_url(bad).is_err(), "{} was accepted", bad);
+        }
+    }
 }

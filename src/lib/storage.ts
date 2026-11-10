@@ -6,6 +6,10 @@ export interface AppConfig {
   sessionToken: string;
   syncFolder: string;
   theme: "light" | "dark";
+  /** Android only: keep syncing in a background service that also starts on boot. */
+  autoSync: boolean;
+  /** Android only: keep the profile password (Keystore-encrypted, native side) to re-login after a 401. */
+  rememberPassword: boolean;
 }
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -14,6 +18,8 @@ const DEFAULT_CONFIG: AppConfig = {
   sessionToken: "",
   syncFolder: "",
   theme: "dark",
+  autoSync: false,
+  rememberPassword: false,
 };
 
 export function loadConfig(): AppConfig {
@@ -27,6 +33,8 @@ export function loadConfig(): AppConfig {
       sessionToken: parsed.sessionToken ?? "",
       syncFolder: parsed.syncFolder ?? "",
       theme: parsed.theme === "light" ? "light" : "dark",
+      autoSync: parsed.autoSync === true,
+      rememberPassword: parsed.rememberPassword === true,
     };
   } catch {
     return DEFAULT_CONFIG;

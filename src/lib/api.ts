@@ -7,7 +7,8 @@ interface RequestOptions {
   sessionToken?: string;
 }
 
-const REQUEST_TIMEOUT_MS = 12000;
+// The flight list can take well over 12 s while the server is importing a batch of logs.
+const REQUEST_TIMEOUT_MS = 60000;
 
 function makeHeaders(opts: RequestOptions): Record<string, string> {
   const headers: Record<string, string> = {

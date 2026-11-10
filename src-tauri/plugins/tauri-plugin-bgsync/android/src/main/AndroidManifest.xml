@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Start the sync service after the controller boots. -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Read DJI Pilot 2 logs from shared storage (DJI/<app>/FlightRecord). -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+
+    <!-- Lets the folder search tell whether a DJI flight app is installed (Android 11+ package visibility). -->
+    <queries>
+        <package android:name="com.dji.industry.pilot" />
+        <package android:name="dji.go.v5" />
+        <package android:name="dji.go.v4" />
+    </queries>
+
+    <!-- requestLegacyExternalStorage keeps plain file access working on Android 10 (RC Plus).
+         allowBackup="false" keeps the encrypted login and session out of device backups. -->
+    <application
+        android:allowBackup="false"
+        android:requestLegacyExternalStorage="true">
+        <service
+            android:name="com.opendronelog.bgsync.SyncService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <receiver
+            android:name="com.opendronelog.bgsync.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>
